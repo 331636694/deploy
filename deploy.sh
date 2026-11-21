@@ -45,6 +45,30 @@ check_stack(){
     v6) has_v6 || die "本机没有全局 IPv6 地址，无法按 IPv6 部署（选菜单 1/3 走 IPv4）" ;;
   esac
 }
+detect_xray_stack(){
+  # 已有 xray 部署用的栈：元数据 STACK > 配置监听地址；没有部署返回空
+  local s
+  s="$(meta_get "$XRAY_META" STACK)"
+  if [ -z "$s" ] && [ -f "$XRAY_CONF" ]; then
+    case "$(grep -oE '"listen": *"[^"]+"' "$XRAY_CONF" 2>/dev/null | head -1 | sed 's/.*"//;s/"$//')" in
+      ::)      s=v6 ;;
+      0.0.0.0) s=v4 ;;
+    esac
+  fi
+  printf '%s' "$s"
+}
+detect_hy_stack(){
+  # 已有 hysteria2 部署用的栈：元数据 STACK > 配置监听地址；没有部署返回空
+  local s
+  s="$(meta_get "$HY_META" STACK)"
+  if [ -z "$s" ] && [ -f "$HY_CONF" ]; then
+    case "$(grep -m1 '^listen:' "$HY_CONF" 2>/dev/null)" in
+      *'[::]'*) s=v6 ;;
+      *listen*) s=v4 ;;
+    esac
+  fi
+  printf '%s' "$s"
+}
 
 # ---------- 固定路径 ----------
 XRAY_CONF=/usr/local/etc/xray/config.json
@@ -109,7 +133,6 @@ install_deps(){
 }
 
 info "系统：${PRETTY_NAME:-$ID}  架构：${ARCH}  systemd：$([ $HAS_SYSTEMD = 1 ] && echo 有 || echo 无)  openrc：$([ $HAS_OPENRC = 1 ] && echo 有 || echo 无)"
-info "网络：IPv4 $(has_v4 && echo 有 || echo 无)  IPv6 $(has_v6 && echo 有 || echo 无)（菜单里按实际选择）"
 
 # ---------- 元数据读写（deploy-info.txt，key=value） ----------
 meta_get(){
@@ -282,7 +305,7 @@ ensure_running(){
 show_reality_existing(){
   # 复用已有部署：优先读 deploy-info.txt，没有就从 config.json 里捞。成功返回 0。
   local port uuid sni pub sid priv stack
-  stack="$(meta_get "$XRAY_META" STACK)"
+  stack="$(detect_xray_stack)"
   if [ -f "$XRAY_META" ]; then
     port="$(meta_get "$XRAY_META" PORT)"
     uuid="$(meta_get "$XRAY_META" UUID)"
@@ -303,13 +326,6 @@ show_reality_existing(){
       [ -n "$pub" ] || pub="$(xray x25519 -i "$priv" 2>/dev/null | sed -n 's/^Public[Kk]ey: *//p' | head -1)"
     fi
   fi
-  # 栈来源：元数据 STACK > 配置监听地址 > 当前菜单选择
-  if [ -z "${stack:-}" ] && [ -f "$XRAY_CONF" ]; then
-    case "$(grep -oE '"listen": *"[^"]+"' "$XRAY_CONF" 2>/dev/null | head -1 | sed 's/.*"//;s/"$//')" in
-      ::) stack=v6 ;;
-      *)  stack=v4 ;;
-    esac
-  fi
   [ -n "${stack:-}" ] || stack="$STACK"
   STACK="$stack"
   [ -n "${uuid:-}" ] && [ -n "${port:-}" ] && [ -n "${pub:-}" ] || return 1
@@ -321,7 +337,7 @@ show_reality_existing(){
   line
   printf "${BOLD}${GREEN}已部署过，复用现有配置${NC}（未改动任何文件，旧客户端继续可用）\n"
   line
-  echo "协议：VLESS + REALITY + Vision"
+  echo "协议：VLESS + REALITY + Vision（IPv${STACK#v}）"
   echo "地址：${ADDR}"
   echo "端口：${port}"
   echo "UUID：${uuid}"
@@ -339,6 +355,18 @@ show_reality_existing(){
 
 deploy_reality(){
   line; info "部署 VLESS + REALITY + Vision（IPv${STACK#v}）"; line
+
+  # ---- 栈一致性：已有部署与所选栈不同时，先问清楚再动手 ----
+  local have
+  have="$(detect_xray_stack)"
+  if [ "$FORCE" != 1 ] && [ -n "$have" ] && [ "$have" != "$STACK" ]; then
+    warn "已有部署是 IPv${have#v}，与本次选择的 IPv${STACK#v} 不同"
+    read -rp "重新生成为 IPv${STACK#v}？（旧客户端链接会失效）[y/N]：" yn || yn=""
+    case "$yn" in
+      y|Y) FORCE=1; ok "将重新生成为 IPv${STACK#v}" ;;
+      *)   STACK="$have"; info "沿用已有 IPv${have#v} 配置（仅展示，不改动）" ;;
+    esac
+  fi
 
   # ---- 幂等：已有可用配置就复用，绝不覆盖正在用的服务 ----
   if [ -f "$XRAY_CONF" ] && [ "$FORCE" != 1 ]; then
@@ -481,7 +509,7 @@ EOF
   line
   printf "${BOLD}${GREEN}部署完成${NC}\n"
   line
-  echo "协议：VLESS + REALITY + Vision"
+  echo "协议：VLESS + REALITY + Vision（IPv${STACK#v}）"
   echo "地址：${ADDR}"
   echo "端口：${PORT}"
   echo "UUID：${UUID}"
@@ -503,7 +531,7 @@ EOF
 # ============================================================
 show_hy2_existing(){
   local port pass obfs sni stack
-  stack="$(meta_get "$HY_META" STACK)"
+  stack="$(detect_hy_stack)"
   if [ -f "$HY_META" ]; then
     port="$(meta_get "$HY_META" PORT)"
     pass="$(meta_get "$HY_META" PASS)"
@@ -520,13 +548,6 @@ show_hy2_existing(){
   [ -n "${pass:-}" ] && [ -n "${port:-}" ] && [ -n "${obfs:-}" ] || return 1
   [ -n "${sni:-}" ] || sni="www.bing.com"
 
-  # 栈来源：元数据 STACK > 配置监听地址 > 当前菜单选择
-  if [ -z "${stack:-}" ] && [ -f "$HY_CONF" ]; then
-    case "$(grep -m1 '^listen:' "$HY_CONF" 2>/dev/null)" in
-      *'[::]'*) stack=v6 ;;
-      *)        stack=v4 ;;
-    esac
-  fi
   [ -n "${stack:-}" ] || stack="$STACK"
   STACK="$stack"
 
@@ -544,7 +565,7 @@ show_hy2_existing(){
   line
   printf "${BOLD}${GREEN}已部署过，复用现有配置${NC}（未改动任何文件，旧客户端继续可用）\n"
   line
-  echo "协议：Hysteria2 + Salamander"
+  echo "协议：Hysteria2 + Salamander（IPv${STACK#v}）"
   echo "地址：${ADDR}"
   echo "端口：${port}（UDP）"
   echo "密码：${pass}"
@@ -593,6 +614,18 @@ issue_real_cert(){
 
 deploy_hy2(){
   line; info "部署 Hysteria2 + Salamander 混淆（IPv${STACK#v}）"; line
+
+  # ---- 栈一致性：已有部署与所选栈不同时，先问清楚再动手 ----
+  local have
+  have="$(detect_hy_stack)"
+  if [ "$FORCE" != 1 ] && [ -n "$have" ] && [ "$have" != "$STACK" ]; then
+    warn "已有部署是 IPv${have#v}，与本次选择的 IPv${STACK#v} 不同"
+    read -rp "重新生成为 IPv${STACK#v}？（旧客户端链接会失效）[y/N]：" yn || yn=""
+    case "$yn" in
+      y|Y) FORCE=1; ok "将重新生成为 IPv${STACK#v}" ;;
+      *)   STACK="$have"; info "沿用已有 IPv${have#v} 配置（仅展示，不改动）" ;;
+    esac
+  fi
 
   # ---- 幂等：已有可用配置就复用 ----
   if [ -f "$HY_CONF" ] && [ "$FORCE" != 1 ]; then
@@ -746,7 +779,7 @@ EOF
   line
   printf "${BOLD}${GREEN}部署完成${NC}\n"
   line
-  echo "协议：Hysteria2 + Salamander"
+  echo "协议：Hysteria2 + Salamander（IPv${STACK#v}）"
   echo "地址：${ADDR}"
   echo "端口：${PORT}（UDP）"
   echo "密码：${PASS}"
@@ -879,12 +912,15 @@ cat <<'BANNER'
   请选择协议与 IP 栈（客户端链接自动带对应地址）：
 
     1) VLESS + REALITY + Vision · IPv4   （TCP，推荐，最隐蔽）
-    2) VLESS + REALITY + Vision · IPv6   （纯 v6 机器 / v6 出口）
+    2) VLESS + REALITY + Vision · IPv6   （需机器有全局 IPv6）
     3) Hysteria2 + Salamander  · IPv4    （UDP，弱网快）
-    4) Hysteria2 + Salamander  · IPv6    （纯 v6 机器 / v6 出口）
+    4) Hysteria2 + Salamander  · IPv6    （需机器有全局 IPv6）
 
     0) 退出
 BANNER
+V4OK="有"; has_v4 || V4OK="无"
+V6OK="有"; has_v6 || V6OK="无"
+info "本机检测：IPv4 ${V4OK}  IPv6 ${V6OK}   ｜ 脚本版本：v2.0"
 echo
 read -rp "  输入序号 [1/2/3/4/0]：" CHOICE || CHOICE=0
 echo
