@@ -1,6 +1,7 @@
 # 独角鲸云 · 一键部署
 
 支持：VLESS + REALITY + Vision (TCP) / Hysteria2 + Salamander (UDP)
+部署时可选 **IPv4 / IPv6**：菜单 1/2 = VLESS 的 v4/v6，3/4 = Hysteria2 的 v4/v6
 适用：Debian 11/12/13、Ubuntu 20/22/24、Alpine 3.19+（NAT 容器或独立机）
 
 ## 一键部署

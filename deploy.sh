@@ -3,6 +3,7 @@
 #  独角鲸云 · 一键部署
 #  支持：VLESS + REALITY + Vision (TCP)  /  Hysteria2 + Salamander (UDP)
 #  适用：Debian 11/12/13、Ubuntu 20/22/24、Alpine 3.19+（NAT 容器或独立机）
+#  部署时可选 IPv4 / IPv6（主菜单 1/2 = VLESS 的 v4/v6，3/4 = Hysteria2 的 v4/v6）
 #  用法：bash <(curl -fsSL https://你的域名/deploy.sh)
 #        bash deploy.sh --uninstall   卸载：停服务/删配置/删二进制/删防火墙规则
 #        bash deploy.sh --force       强制重新生成配置（会作废旧客户端链接）
@@ -16,6 +17,35 @@ warn(){ printf "${YELLOW}[!]${NC} %s\n" "$*"; }
 die(){  printf "${RED}[✗]${NC} %s\n" "$*" >&2; exit 1; }
 line(){ printf "${CYAN}────────────────────────────────────────────${NC}\n"; }
 
+# ---------- 通用：v4/v6 探测与地址格式 ----------
+has_v4(){
+  if command -v ip >/dev/null 2>&1; then
+    ip -4 addr show 2>/dev/null | grep 'inet ' | grep -qv 'inet 127\.'
+  else
+    curl -4 -fsS --max-time 6 https://api4.ipify.org >/dev/null 2>&1
+  fi
+}
+has_v6(){
+  if command -v ip >/dev/null 2>&1; then
+    ip -6 addr show 2>/dev/null | grep 'inet6' | grep -qv -e 'fe80' -e '::1/128'
+  else
+    curl -6 -fsS --max-time 6 https://api6.ipify.org >/dev/null 2>&1
+  fi
+}
+fmt_addr(){
+  # $1=IP → 可直接放进 URI host 的形式（IPv6 自动加方括号）
+  case "$1" in
+    *:*) printf '[%s]' "$1" ;;
+    *)   printf '%s' "$1" ;;
+  esac
+}
+check_stack(){
+  case "$STACK" in
+    v4) has_v4 || die "本机没有全局 IPv4 地址，无法按 IPv4 部署（选菜单 2/4 走 IPv6）" ;;
+    v6) has_v6 || die "本机没有全局 IPv6 地址，无法按 IPv6 部署（选菜单 1/3 走 IPv4）" ;;
+  esac
+}
+
 # ---------- 固定路径 ----------
 XRAY_CONF=/usr/local/etc/xray/config.json
 XRAY_META=/usr/local/etc/xray/deploy-info.txt
@@ -23,6 +53,7 @@ HY_CONF=/etc/hysteria/config.yaml
 HY_META=/etc/hysteria/deploy-info.txt
 
 # ---------- 参数 ----------
+STACK="v4"    # v4 | v6，主菜单选择
 FORCE=0
 DO_UNINSTALL=0
 for a in "$@"; do
@@ -32,10 +63,11 @@ for a in "$@"; do
     -h|--help)
       cat <<'HLP'
 用法：
-  bash deploy.sh               交互式部署（选 1 = VLESS+REALITY，选 2 = Hysteria2）
+  bash deploy.sh               交互式部署（菜单选协议 + IPv4/IPv6：1/2=VLESS，3/4=Hysteria2）
   bash deploy.sh --force       已部署过时强制重新生成配置（旧客户端链接会失效）
   bash deploy.sh --uninstall   卸载：停服务 / 禁自启 / 删配置 / 删二进制 / 删防火墙规则
 说明：重复执行默认「复用已有配置」，不会打断正在使用的客户端。
+说明：选 IPv6 要求本机有全局 IPv6 地址；生成的链接自动带 [] 包住的 v6 地址。
 支持：Debian / Ubuntu（systemd）、Alpine（OpenRC）。
 注意：Alpine 精简镜像若没有 bash，先 apk add bash 再执行本脚本。
 HLP
@@ -77,6 +109,7 @@ install_deps(){
 }
 
 info "系统：${PRETTY_NAME:-$ID}  架构：${ARCH}  systemd：$([ $HAS_SYSTEMD = 1 ] && echo 有 || echo 无)  openrc：$([ $HAS_OPENRC = 1 ] && echo 有 || echo 无)"
+info "网络：IPv4 $(has_v4 && echo 有 || echo 无)  IPv6 $(has_v6 && echo 有 || echo 无)（菜单里按实际选择）"
 
 # ---------- 元数据读写（deploy-info.txt，key=value） ----------
 meta_get(){
@@ -137,15 +170,24 @@ close_port(){
   fi
 }
 
-# ---------- 通用：取公网 IP ----------
+# ---------- 通用：取公网 IP（按所选栈 v4/v6） ----------
 get_ip(){
   local ip=""
-  ip="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null)"
-  [ -n "$ip" ] || ip="$(curl -fsS --max-time 8 https://ifconfig.me/ip 2>/dev/null)"
-  [ -n "$ip" ] || ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
-  case "$ip" in
-    ''|*[!0-9a-fA-F.:]*) ip="你的IP" ;;
-  esac
+  if [ "$STACK" = "v6" ]; then
+    ip="$(curl -6 -fsS --max-time 8 https://api6.ipify.org 2>/dev/null)"
+    [ -n "$ip" ] || ip="$(curl -6 -fsS --max-time 8 https://v6.ident.me 2>/dev/null)"
+    [ -n "$ip" ] || ip="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | sed -n 's/.* src \([0-9a-fA-F:]*\).*/\1/p' | head -1)"
+    case "$ip" in
+      ''|*[!0-9a-fA-F:]*) ip="你的IPv6" ;;
+    esac
+  else
+    ip="$(curl -4 -fsS --max-time 8 https://api4.ipify.org 2>/dev/null)"
+    [ -n "$ip" ] || ip="$(curl -4 -fsS --max-time 8 https://ifconfig.me/ip 2>/dev/null)"
+    [ -n "$ip" ] || ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
+    case "$ip" in
+      ''|*[!0-9a-fA-F.:]*) ip="你的IPv4" ;;
+    esac
+  fi
   printf '%s\n' "$ip"
 }
 
@@ -239,7 +281,8 @@ ensure_running(){
 # ============================================================
 show_reality_existing(){
   # 复用已有部署：优先读 deploy-info.txt，没有就从 config.json 里捞。成功返回 0。
-  local port uuid sni pub sid priv
+  local port uuid sni pub sid priv stack
+  stack="$(meta_get "$XRAY_META" STACK)"
   if [ -f "$XRAY_META" ]; then
     port="$(meta_get "$XRAY_META" PORT)"
     uuid="$(meta_get "$XRAY_META" UUID)"
@@ -260,16 +303,26 @@ show_reality_existing(){
       [ -n "$pub" ] || pub="$(xray x25519 -i "$priv" 2>/dev/null | sed -n 's/^Public[Kk]ey: *//p' | head -1)"
     fi
   fi
+  # 栈来源：元数据 STACK > 配置监听地址 > 当前菜单选择
+  if [ -z "${stack:-}" ] && [ -f "$XRAY_CONF" ]; then
+    case "$(grep -oE '"listen": *"[^"]+"' "$XRAY_CONF" 2>/dev/null | head -1 | sed 's/.*"//;s/"$//')" in
+      ::) stack=v6 ;;
+      *)  stack=v4 ;;
+    esac
+  fi
+  [ -n "${stack:-}" ] || stack="$STACK"
+  STACK="$stack"
   [ -n "${uuid:-}" ] && [ -n "${port:-}" ] && [ -n "${pub:-}" ] || return 1
 
   SERVER_IP="$(get_ip)"
-  LINK="vless://${uuid}@${SERVER_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp&headerType=none#%E7%8B%AC%E8%A7%92%E9%B2%B8%E4%BA%91-REALITY"
+  ADDR="$(fmt_addr "$SERVER_IP")"
+  LINK="vless://${uuid}@${ADDR}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp&headerType=none#%E7%8B%AC%E8%A7%92%E9%B2%B8%E4%BA%91-REALITY"
   echo
   line
   printf "${BOLD}${GREEN}已部署过，复用现有配置${NC}（未改动任何文件，旧客户端继续可用）\n"
   line
   echo "协议：VLESS + REALITY + Vision"
-  echo "地址：${SERVER_IP}"
+  echo "地址：${ADDR}"
   echo "端口：${port}"
   echo "UUID：${uuid}"
   echo "SNI ：${sni}"
@@ -285,7 +338,7 @@ show_reality_existing(){
 }
 
 deploy_reality(){
-  line; info "部署 VLESS + REALITY + Vision"; line
+  line; info "部署 VLESS + REALITY + Vision（IPv${STACK#v}）"; line
 
   # ---- 幂等：已有可用配置就复用，绝不覆盖正在用的服务 ----
   if [ -f "$XRAY_CONF" ] && [ "$FORCE" != 1 ]; then
@@ -314,6 +367,7 @@ deploy_reality(){
     fi
   fi
 
+  check_stack
   PORT="$(pick_port)"
   port_busy "$PORT" && die "端口 $PORT 已被占用（占用者：$(port_owner "$PORT" || echo 未知)），换一个"
 
@@ -364,11 +418,13 @@ deploy_reality(){
   [ -n "$PRIV" ] && [ -n "$PUB" ] || die "密钥生成失败，原始输出：$KEYPAIR"
 
   mkdir -p /usr/local/etc/xray
+  # v4 监听 0.0.0.0；v6 监听 ::（Linux 默认双栈，v4-mapped 也收）
+  if [ "$STACK" = "v6" ]; then LISTEN="::"; else LISTEN="0.0.0.0"; fi
   cat > "$XRAY_CONF" <<EOF
 {
   "log": { "loglevel": "warning" },
   "inbounds": [{
-    "listen": "0.0.0.0",
+    "listen": "$LISTEN",
     "port": $PORT,
     "protocol": "vless",
     "settings": {
@@ -411,20 +467,22 @@ UUID=$UUID
 SNI=$SNI
 PUB=$PUB
 SID=$SID
+STACK=$STACK
 EOF
   chmod 600 "$XRAY_META"
 
   # 取公网 IP
   SERVER_IP="$(get_ip)"
+  ADDR="$(fmt_addr "$SERVER_IP")"
 
-  LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#%E7%8B%AC%E8%A7%92%E9%B2%B8%E4%BA%91-REALITY"
+  LINK="vless://${UUID}@${ADDR}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#%E7%8B%AC%E8%A7%92%E9%B2%B8%E4%BA%91-REALITY"
 
   echo
   line
   printf "${BOLD}${GREEN}部署完成${NC}\n"
   line
   echo "协议：VLESS + REALITY + Vision"
-  echo "地址：${SERVER_IP}"
+  echo "地址：${ADDR}"
   echo "端口：${PORT}"
   echo "UUID：${UUID}"
   echo "SNI ：${SNI}"
@@ -436,6 +494,7 @@ EOF
   echo
   warn "如果你的机器是 NAT 容器，上面的端口是内网端口，"
   warn "请到控制台把这个端口映射出去，客户端填映射后的公网端口。"
+  [ "$STACK" = "v6" ] && warn "IPv6 节点：客户端所在网络必须支持 IPv6 才能连上。"
   line
 }
 
@@ -443,7 +502,8 @@ EOF
 #  方案二：Hysteria2 + Salamander
 # ============================================================
 show_hy2_existing(){
-  local port pass obfs sni
+  local port pass obfs sni stack
+  stack="$(meta_get "$HY_META" STACK)"
   if [ -f "$HY_META" ]; then
     port="$(meta_get "$HY_META" PORT)"
     pass="$(meta_get "$HY_META" PASS)"
@@ -460,21 +520,32 @@ show_hy2_existing(){
   [ -n "${pass:-}" ] && [ -n "${port:-}" ] && [ -n "${obfs:-}" ] || return 1
   [ -n "${sni:-}" ] || sni="www.bing.com"
 
+  # 栈来源：元数据 STACK > 配置监听地址 > 当前菜单选择
+  if [ -z "${stack:-}" ] && [ -f "$HY_CONF" ]; then
+    case "$(grep -m1 '^listen:' "$HY_CONF" 2>/dev/null)" in
+      *'[::]'*) stack=v6 ;;
+      *)        stack=v4 ;;
+    esac
+  fi
+  [ -n "${stack:-}" ] || stack="$STACK"
+  STACK="$stack"
+
   SERVER_IP="$(get_ip)"
+  ADDR="$(fmt_addr "$SERVER_IP")"
   local insecure
   insecure="$(meta_get "$HY_META" INSECURE 2>/dev/null || true)"
   [ -n "${insecure:-}" ] || insecure=1
   if [ "$insecure" = 1 ]; then
-    LINK="hysteria2://${pass}@${SERVER_IP}:${port}/?sni=${sni}&insecure=1&obfs=salamander&obfs-password=${obfs}#%E7%8B%AC%E8%A7%92%E9%B2%B8%E4%BA%91-HY2"
+    LINK="hysteria2://${pass}@${ADDR}:${port}/?sni=${sni}&insecure=1&obfs=salamander&obfs-password=${obfs}#%E7%8B%AC%E8%A7%92%E9%B2%B8%E4%BA%91-HY2"
   else
-    LINK="hysteria2://${pass}@${SERVER_IP}:${port}/?sni=${sni}&obfs=salamander&obfs-password=${obfs}#%E7%8B%AC%E8%A7%92%E9%B2%B8%E4%BA%91-HY2"
+    LINK="hysteria2://${pass}@${ADDR}:${port}/?sni=${sni}&obfs=salamander&obfs-password=${obfs}#%E7%8B%AC%E8%A7%92%E9%B2%B8%E4%BA%91-HY2"
   fi
   echo
   line
   printf "${BOLD}${GREEN}已部署过，复用现有配置${NC}（未改动任何文件，旧客户端继续可用）\n"
   line
   echo "协议：Hysteria2 + Salamander"
-  echo "地址：${SERVER_IP}"
+  echo "地址：${ADDR}"
   echo "端口：${port}（UDP）"
   echo "密码：${pass}"
   echo "混淆：salamander"
@@ -521,7 +592,7 @@ issue_real_cert(){
 }
 
 deploy_hy2(){
-  line; info "部署 Hysteria2 + Salamander 混淆"; line
+  line; info "部署 Hysteria2 + Salamander 混淆（IPv${STACK#v}）"; line
 
   # ---- 幂等：已有可用配置就复用 ----
   if [ -f "$HY_CONF" ] && [ "$FORCE" != 1 ]; then
@@ -548,6 +619,7 @@ deploy_hy2(){
     fi
   fi
 
+  check_stack
   PORT="$(pick_port)"
   port_busy "$PORT" && die "端口 $PORT 已被占用（占用者：$(port_owner "$PORT" || echo 未知)），换一个"
 
@@ -620,8 +692,10 @@ deploy_hy2(){
   PASS="$(openssl rand -hex 16)"
   OBFS="$(openssl rand -hex 16)"
 
+  # v4 监听 0.0.0.0；v6 监听 [::]（Linux 默认双栈，v4-mapped 也收）
+  if [ "$STACK" = "v6" ]; then HLISTEN="\"[::]:$PORT\""; else HLISTEN="\"0.0.0.0:$PORT\""; fi
   cat > "$HY_CONF" <<EOF
-listen: :$PORT
+listen: $HLISTEN
 
 tls:
   cert: /etc/hysteria/cert.pem
@@ -655,15 +729,17 @@ PASS=$PASS
 OBFS=$OBFS
 SNI=$HY_SNI
 INSECURE=$HY_INSECURE
+STACK=$STACK
 EOF
   chmod 600 "$HY_META"
 
   SERVER_IP="$(get_ip)"
+  ADDR="$(fmt_addr "$SERVER_IP")"
 
   if [ "$HY_INSECURE" = 1 ]; then
-    LINK="hysteria2://${PASS}@${SERVER_IP}:${PORT}/?sni=${HY_SNI}&insecure=1&obfs=salamander&obfs-password=${OBFS}#%E7%8B%AC%E8%A7%92%E9%B2%B8%E4%BA%91-HY2"
+    LINK="hysteria2://${PASS}@${ADDR}:${PORT}/?sni=${HY_SNI}&insecure=1&obfs=salamander&obfs-password=${OBFS}#%E7%8B%AC%E8%A7%92%E9%B2%B8%E4%BA%91-HY2"
   else
-    LINK="hysteria2://${PASS}@${SERVER_IP}:${PORT}/?sni=${HY_SNI}&obfs=salamander&obfs-password=${OBFS}#%E7%8B%AC%E8%A7%92%E9%B2%B8%E4%BA%91-HY2"
+    LINK="hysteria2://${PASS}@${ADDR}:${PORT}/?sni=${HY_SNI}&obfs=salamander&obfs-password=${OBFS}#%E7%8B%AC%E8%A7%92%E9%B2%B8%E4%BA%91-HY2"
   fi
 
   echo
@@ -671,7 +747,7 @@ EOF
   printf "${BOLD}${GREEN}部署完成${NC}\n"
   line
   echo "协议：Hysteria2 + Salamander"
-  echo "地址：${SERVER_IP}"
+  echo "地址：${ADDR}"
   echo "端口：${PORT}（UDP）"
   echo "密码：${PASS}"
   echo "混淆：salamander"
@@ -686,6 +762,7 @@ EOF
     ok "使用真证书（$HY_SNI），客户端不需要勾选跳过验证。"
   fi
   warn "NAT 容器请到控制台映射这个 UDP 端口。"
+  [ "$STACK" = "v6" ] && warn "IPv6 节点：客户端所在网络必须支持 IPv6 才能连上。"
   line
 }
 
@@ -799,20 +876,24 @@ cat <<'BANNER'
   ║        独角鲸云 · 一键部署               ║
   ╚══════════════════════════════════════════╝
 
-  请选择要部署的协议（只支持这两种）：
+  请选择协议与 IP 栈（客户端链接自动带对应地址）：
 
-    1) VLESS + REALITY + Vision   （TCP，推荐，最隐蔽）
-    2) Hysteria2 + Salamander     （UDP，弱网快）
+    1) VLESS + REALITY + Vision · IPv4   （TCP，推荐，最隐蔽）
+    2) VLESS + REALITY + Vision · IPv6   （纯 v6 机器 / v6 出口）
+    3) Hysteria2 + Salamander  · IPv4    （UDP，弱网快）
+    4) Hysteria2 + Salamander  · IPv6    （纯 v6 机器 / v6 出口）
 
     0) 退出
 BANNER
 echo
-read -rp "  输入序号 [1/2/0]：" CHOICE || CHOICE=0
+read -rp "  输入序号 [1/2/3/4/0]：" CHOICE || CHOICE=0
 echo
 
 case "$CHOICE" in
-  1) deploy_reality ;;
-  2) deploy_hy2 ;;
+  1) STACK=v4; deploy_reality ;;
+  2) STACK=v6; deploy_reality ;;
+  3) STACK=v4; deploy_hy2 ;;
+  4) STACK=v6; deploy_hy2 ;;
   0) exit 0 ;;
   *) die "无效选择" ;;
 esac
